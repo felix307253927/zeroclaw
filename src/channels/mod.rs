@@ -35,6 +35,7 @@ pub mod slack;
 pub mod telegram;
 pub mod traits;
 pub mod transcription;
+pub mod unibi;
 pub mod wati;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
@@ -62,6 +63,7 @@ pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
+pub use unibi::UnibiChannel;
 pub use wati::WatiChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
@@ -71,7 +73,7 @@ use crate::agent::loop_::{
     build_shell_policy_instructions, build_tool_instructions_from_specs,
     run_tool_call_loop_with_non_cli_approval_context, scrub_credentials, NonCliApprovalContext,
 };
-use crate::approval::{ApprovalManager, ApprovalResponse, PendingApprovalError};
+use crate::approval::{ApprovalManager, PendingApprovalError};
 use crate::config::{Config, NonCliNaturalLanguageApprovalMode};
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -983,6 +985,20 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         api_url: ctx.api_url.clone(),
         reliability: (*ctx.reliability).clone(),
     }
+}
+
+fn runtime_perplexity_filter_snapshot(
+    ctx: &ChannelRuntimeContext,
+) -> crate::config::PerplexityFilterConfig {
+    if let Some(config_path) = runtime_config_path(ctx) {
+        let store = runtime_config_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = store.get(&config_path) {
+            return state.perplexity_filter.clone();
+        }
+    }
+    crate::config::PerplexityFilterConfig::default()
 }
 
 fn snapshot_non_cli_excluded_tools(ctx: &ChannelRuntimeContext) -> Vec<String> {
@@ -2015,6 +2031,8 @@ async fn handle_runtime_command_if_needed(
     }
 
     let response = match command {
+        ChannelRuntimeCommand::ApprovePendingRequest(_) => "Not implemented".to_string(),
+        ChannelRuntimeCommand::DenyToolApproval(_) => "Not implemented".to_string(),
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
             match resolve_provider_alias(&raw_provider) {
@@ -4547,6 +4565,13 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "ClawdTalk",
             channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
+        });
+    }
+
+    if let Some(ref unibi) = config.channels_config.unibi {
+        channels.push(ConfiguredChannel {
+            display_name: "Unibi",
+            channel: Arc::new(UnibiChannel::new(unibi.clone())),
         });
     }
 
