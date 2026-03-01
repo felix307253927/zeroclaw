@@ -83,7 +83,7 @@ use crate::agent::loop_::{
     run_tool_call_loop_with_reply_target, scrub_credentials, SafetyHeartbeatConfig,
 };
 use crate::agent::session::{resolve_session_id, shared_session_manager, Session, SessionManager};
-use crate::approval::{ApprovalManager, PendingApprovalError};
+use crate::approval::{ApprovalManager, ApprovalResponse, PendingApprovalError};
 use crate::config::{Config, NonCliNaturalLanguageApprovalMode};
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -1041,34 +1041,6 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         api_url: ctx.api_url.clone(),
         reliability: (*ctx.reliability).clone(),
     }
-}
-
-fn runtime_perplexity_filter_snapshot(
-    ctx: &ChannelRuntimeContext,
-) -> crate::config::PerplexityFilterConfig {
-    if let Some(config_path) = runtime_config_path(ctx) {
-        let store = runtime_config_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(state) = store.get(&config_path) {
-            return state.perplexity_filter.clone();
-        }
-    }
-    crate::config::PerplexityFilterConfig::default()
-}
-
-fn runtime_perplexity_filter_snapshot(
-    ctx: &ChannelRuntimeContext,
-) -> crate::config::PerplexityFilterConfig {
-    if let Some(config_path) = runtime_config_path(ctx) {
-        let store = runtime_config_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(state) = store.get(&config_path) {
-            return state.perplexity_filter.clone();
-        }
-    }
-    crate::config::PerplexityFilterConfig::default()
 }
 
 /// Return a snapshot of the runtime perplexity-filter config, falling back to
@@ -5061,13 +5033,6 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "ClawdTalk",
             channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
-        });
-    }
-
-    if let Some(ref unibi) = config.channels_config.unibi {
-        channels.push(ConfiguredChannel {
-            display_name: "Unibi",
-            channel: Arc::new(UnibiChannel::new(unibi.clone())),
         });
     }
 
