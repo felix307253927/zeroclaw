@@ -289,6 +289,20 @@ pub(crate) struct NonCliApprovalContext {
 tokio::task_local! {
     static TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT: Option<NonCliApprovalContext>;
     static LOOP_DETECTION_CONFIG: LoopDetectionConfig;
+    static SAFETY_HEARTBEAT_CONFIG: Option<SafetyHeartbeatConfig>;
+}
+
+/// Configuration for periodic safety-constraint re-injection (heartbeat).
+#[derive(Clone)]
+pub(crate) struct SafetyHeartbeatConfig {
+    /// Pre-rendered security policy summary text.
+    pub body: String,
+    /// Inject a heartbeat every `interval` tool iterations (0 = disabled).
+    pub interval: usize,
+}
+
+fn should_inject_safety_heartbeat(counter: usize, interval: usize) -> bool {
+    interval > 0 && counter > 0 && counter % interval == 0
 }
 
 /// Extract a short hint from tool call arguments for progress display.
@@ -686,33 +700,37 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    safety_heartbeat: Option<SafetyHeartbeatConfig>,
 ) -> Result<String> {
     let reply_target = non_cli_approval_context
         .as_ref()
         .map(|ctx| ctx.reply_target.clone());
 
-    TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT
+    SAFETY_HEARTBEAT_CONFIG
         .scope(
-            non_cli_approval_context,
-            TOOL_LOOP_REPLY_TARGET.scope(
-                reply_target,
-                run_tool_call_loop(
-                    provider,
-                    history,
-                    tools_registry,
-                    observer,
-                    provider_name,
-                    model,
-                    temperature,
-                    silent,
-                    approval,
-                    channel_name,
-                    multimodal_config,
-                    max_tool_iterations,
-                    cancellation_token,
-                    on_delta,
-                    hooks,
-                    excluded_tools,
+            safety_heartbeat,
+            TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT.scope(
+                non_cli_approval_context,
+                TOOL_LOOP_REPLY_TARGET.scope(
+                    reply_target,
+                    run_tool_call_loop(
+                        provider,
+                        history,
+                        tools_registry,
+                        observer,
+                        provider_name,
+                        model,
+                        temperature,
+                        silent,
+                        approval,
+                        channel_name,
+                        multimodal_config,
+                        max_tool_iterations,
+                        cancellation_token,
+                        on_delta,
+                        hooks,
+                        excluded_tools,
+                    ),
                 ),
             ),
         )
@@ -787,6 +805,10 @@ pub(crate) async fn run_tool_call_loop(
         .unwrap_or_default();
     let mut loop_detector = LoopDetector::new(ld_config);
     let mut loop_detection_prompt: Option<String> = None;
+    let heartbeat_config = SAFETY_HEARTBEAT_CONFIG
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
     let bypass_non_cli_approval_for_turn =
         approval.is_some_and(|mgr| channel_name != "cli" && mgr.consume_non_cli_allow_all_once());
     if bypass_non_cli_approval_for_turn {
@@ -832,6 +854,19 @@ pub(crate) async fn run_tool_call_loop(
         }
         if let Some(prompt) = loop_detection_prompt.take() {
             request_messages.push(ChatMessage::user(prompt));
+        }
+
+        // ── Safety heartbeat: periodic security-constraint re-injection ──
+        if let Some(ref hb) = heartbeat_config {
+            if should_inject_safety_heartbeat(iteration, hb.interval) {
+                let reminder = format!(
+                    "[Safety Heartbeat — round {}/{}]\n{}",
+                    iteration + 1,
+                    max_iterations,
+                    hb.body
+                );
+                request_messages.push(ChatMessage::user(reminder));
+            }
         }
 
         // ── Progress: LLM thinking ────────────────────────────
@@ -946,7 +981,7 @@ pub(crate) async fn run_tool_call_loop(
                         Some(model),
                         Some(&turn_id),
                         Some(false),
-                        Some(&parse_issue),
+                        Some(parse_issue),
                         serde_json::json!({
                             "iteration": iteration + 1,
                             "response_excerpt": truncate_with_ellipsis(
@@ -1243,13 +1278,30 @@ pub(crate) async fn run_tool_call_loop(
 
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval {
-                if bypass_non_cli_approval_for_turn {
+                let non_cli_session_granted =
+                    channel_name != "cli" && mgr.is_non_cli_session_granted(&tool_name);
+                if bypass_non_cli_approval_for_turn || non_cli_session_granted {
                     mgr.record_decision(
                         &tool_name,
                         &tool_args,
                         ApprovalResponse::Yes,
                         channel_name,
                     );
+                    if non_cli_session_granted {
+                        runtime_trace::record_event(
+                            "approval_bypass_non_cli_session_grant",
+                            Some(channel_name),
+                            Some(provider_name),
+                            Some(model),
+                            Some(&turn_id),
+                            Some(true),
+                            Some("using runtime non-cli session approval grant"),
+                            serde_json::json!({
+                                "iteration": iteration + 1,
+                                "tool": tool_name.clone(),
+                            }),
+                        );
+                    }
                 } else if mgr.needs_approval(&tool_name) {
                     let request = ApprovalRequest {
                         tool_name: tool_name.clone(),
@@ -1690,6 +1742,12 @@ pub(crate) fn build_shell_policy_instructions(autonomy: &crate::config::Autonomy
 // and hard trimming to keep the context window bounded.
 
 #[allow(clippy::too_many_lines)]
+/// Run the agent loop with the given configuration.
+///
+/// When `hooks` is `Some`, the supplied [`HookRunner`](crate::hooks::HookRunner)
+/// is invoked at every tool-call boundary (`before_tool_call` /
+/// `on_after_tool_call`), enabling library consumers to inject safety,
+/// audit, or transformation logic without patching the crate.
 pub async fn run(
     config: Config,
     message: Option<String>,
@@ -1698,6 +1756,7 @@ pub async fn run(
     temperature: f64,
     peripheral_overrides: Vec<String>,
     interactive: bool,
+    hooks: Option<&crate::hooks::HookRunner>,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -1764,10 +1823,12 @@ pub async fn run(
         .or(config.default_provider.as_deref())
         .unwrap_or("openrouter");
 
-    let model_name = model_override
-        .as_deref()
-        .or(config.default_model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4");
+    let model_name = crate::config::resolve_default_model_id(
+        model_override
+            .as_deref()
+            .or(config.default_model.as_deref()),
+        Some(provider_name),
+    );
 
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -1788,7 +1849,7 @@ pub async fn run(
         config.api_url.as_deref(),
         &config.reliability,
         &config.model_routes,
-        model_name,
+        &model_name,
         &provider_runtime_options,
     )?;
 
@@ -1835,6 +1896,10 @@ pub async fn run(
         (
             "memory_store",
             "Save to memory. Use when: preserving durable preferences, decisions, key context. Don't use when: information is transient/noisy/sensitive without need.",
+        ),
+        (
+            "memory_observe",
+            "Store observation memory. Use when: capturing patterns/signals that should remain searchable over long horizons.",
         ),
         (
             "memory_recall",
@@ -1947,7 +2012,7 @@ pub async fn run(
     let native_tools = provider.supports_native_tools();
     let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
-        model_name,
+        &model_name,
         &tool_descs,
         &skills,
         Some(&config.identity),
@@ -1986,7 +2051,7 @@ pub async fn run(
 
         // Inject memory + hardware RAG context into user message
         let mem_context =
-            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
+            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score, None).await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
@@ -2010,30 +2075,52 @@ pub async fn run(
             ping_pong_cycles: config.agent.loop_detection_ping_pong_cycles,
             failure_streak_threshold: config.agent.loop_detection_failure_streak,
         };
-        let response = LOOP_DETECTION_CONFIG
+        let hb_cfg = if config.agent.safety_heartbeat_interval > 0 {
+            Some(SafetyHeartbeatConfig {
+                body: security.summary_for_heartbeat(),
+                interval: config.agent.safety_heartbeat_interval,
+            })
+        } else {
+            None
+        };
+        let response = SAFETY_HEARTBEAT_CONFIG
             .scope(
-                ld_cfg,
-                run_tool_call_loop(
-                    provider.as_ref(),
-                    &mut history,
-                    &tools_registry,
-                    observer.as_ref(),
-                    provider_name,
-                    model_name,
-                    temperature,
-                    false,
-                    approval_manager.as_ref(),
-                    channel_name,
-                    &config.multimodal,
-                    config.agent.max_tool_iterations,
-                    None,
-                    None,
-                    None,
-                    &[],
+                hb_cfg,
+                LOOP_DETECTION_CONFIG.scope(
+                    ld_cfg,
+                    run_tool_call_loop(
+                        provider.as_ref(),
+                        &mut history,
+                        &tools_registry,
+                        observer.as_ref(),
+                        provider_name,
+                        &model_name,
+                        temperature,
+                        false,
+                        approval_manager.as_ref(),
+                        channel_name,
+                        &config.multimodal,
+                        config.agent.max_tool_iterations,
+                        None,
+                        None,
+                        hooks,
+                        &[],
+                    ),
                 ),
             )
             .await?;
         final_output = response.clone();
+        if config.memory.auto_save && response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+            let assistant_key = autosave_memory_key("assistant_resp");
+            let _ = mem
+                .store(
+                    &assistant_key,
+                    &response,
+                    MemoryCategory::Conversation,
+                    None,
+                )
+                .await;
+        }
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
@@ -2043,6 +2130,7 @@ pub async fn run(
 
         // Persistent conversation history across turns
         let mut history = vec![ChatMessage::system(&system_prompt)];
+        let mut interactive_turn: usize = 0;
         // Reusable readline editor for UTF-8 input support
         let mut rl = Editor::with_config(
             RlConfig::builder()
@@ -2093,6 +2181,7 @@ pub async fn run(
                     rl.clear_history()?;
                     history.clear();
                     history.push(ChatMessage::system(&system_prompt));
+                    interactive_turn = 0;
                     // Clear conversation and daily memory
                     let mut cleared = 0;
                     for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
@@ -2122,8 +2211,13 @@ pub async fn run(
             }
 
             // Inject memory + hardware RAG context into user message
-            let mem_context =
-                build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
+            let mem_context = build_context(
+                mem.as_ref(),
+                &user_input,
+                config.memory.min_relevance_score,
+                None,
+            )
+            .await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
@@ -2138,32 +2232,57 @@ pub async fn run(
             };
 
             history.push(ChatMessage::user(&enriched));
+            interactive_turn += 1;
+
+            // Inject interactive safety heartbeat at configured turn intervals
+            if should_inject_safety_heartbeat(
+                interactive_turn,
+                config.agent.safety_heartbeat_turn_interval,
+            ) {
+                let reminder = format!(
+                    "[Safety Heartbeat — turn {}]\n{}",
+                    interactive_turn,
+                    security.summary_for_heartbeat()
+                );
+                history.push(ChatMessage::user(reminder));
+            }
 
             let ld_cfg = LoopDetectionConfig {
                 no_progress_threshold: config.agent.loop_detection_no_progress_threshold,
                 ping_pong_cycles: config.agent.loop_detection_ping_pong_cycles,
                 failure_streak_threshold: config.agent.loop_detection_failure_streak,
             };
-            let response = match LOOP_DETECTION_CONFIG
+            let hb_cfg = if config.agent.safety_heartbeat_interval > 0 {
+                Some(SafetyHeartbeatConfig {
+                    body: security.summary_for_heartbeat(),
+                    interval: config.agent.safety_heartbeat_interval,
+                })
+            } else {
+                None
+            };
+            let response = match SAFETY_HEARTBEAT_CONFIG
                 .scope(
-                    ld_cfg,
-                    run_tool_call_loop(
-                        provider.as_ref(),
-                        &mut history,
-                        &tools_registry,
-                        observer.as_ref(),
-                        provider_name,
-                        model_name,
-                        temperature,
-                        false,
-                        approval_manager.as_ref(),
-                        channel_name,
-                        &config.multimodal,
-                        config.agent.max_tool_iterations,
-                        None,
-                        None,
-                        None,
-                        &[],
+                    hb_cfg,
+                    LOOP_DETECTION_CONFIG.scope(
+                        ld_cfg,
+                        run_tool_call_loop(
+                            provider.as_ref(),
+                            &mut history,
+                            &tools_registry,
+                            observer.as_ref(),
+                            provider_name,
+                            &model_name,
+                            temperature,
+                            false,
+                            approval_manager.as_ref(),
+                            channel_name,
+                            &config.multimodal,
+                            config.agent.max_tool_iterations,
+                            None,
+                            None,
+                            hooks,
+                            &[],
+                        ),
                     ),
                 )
                 .await
@@ -2194,6 +2313,17 @@ pub async fn run(
                 }
             };
             final_output = response.clone();
+            if config.memory.auto_save && response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+                let assistant_key = autosave_memory_key("assistant_resp");
+                let _ = mem
+                    .store(
+                        &assistant_key,
+                        &response,
+                        MemoryCategory::Conversation,
+                        None,
+                    )
+                    .await;
+            }
             if let Err(e) = crate::channels::Channel::send(
                 &cli,
                 &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
@@ -2208,7 +2338,7 @@ pub async fn run(
             if let Ok(compacted) = auto_compact_history(
                 &mut history,
                 provider.as_ref(),
-                model_name,
+                &model_name,
                 config.agent.max_history_messages,
             )
             .await
@@ -2238,6 +2368,14 @@ pub async fn run(
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
+    process_message_with_session(config, message, None).await
+}
+
+pub async fn process_message_with_session(
+    config: Config,
+    message: &str,
+    session_id: Option<&str>,
+) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -2281,10 +2419,10 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     tools_registry.extend(peripheral_tools);
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
-    let model_name = config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+    let model_name = crate::config::resolve_default_model_id(
+        config.default_model.as_deref(),
+        Some(provider_name),
+    );
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
@@ -2328,6 +2466,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ("file_read", "Read file contents."),
         ("file_write", "Write file contents."),
         ("memory_store", "Save to memory."),
+        ("memory_observe", "Store observation memory."),
         ("memory_recall", "Search memory."),
         ("memory_forget", "Delete a memory entry."),
         (
@@ -2400,7 +2539,13 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     }
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
 
-    let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
+    let mem_context = build_context(
+        mem.as_ref(),
+        message,
+        config.memory.min_relevance_score,
+        session_id,
+    )
+    .await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
     let hw_context = hardware_rag
         .as_ref()
@@ -2419,19 +2564,31 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ChatMessage::user(&enriched),
     ];
 
-    agent_turn(
-        provider.as_ref(),
-        &mut history,
-        &tools_registry,
-        observer.as_ref(),
-        provider_name,
-        &model_name,
-        config.default_temperature,
-        true,
-        &config.multimodal,
-        config.agent.max_tool_iterations,
-    )
-    .await
+    let hb_cfg = if config.agent.safety_heartbeat_interval > 0 {
+        Some(SafetyHeartbeatConfig {
+            body: security.summary_for_heartbeat(),
+            interval: config.agent.safety_heartbeat_interval,
+        })
+    } else {
+        None
+    };
+    SAFETY_HEARTBEAT_CONFIG
+        .scope(
+            hb_cfg,
+            agent_turn(
+                provider.as_ref(),
+                &mut history,
+                &tools_registry,
+                observer.as_ref(),
+                provider_name,
+                &model_name,
+                config.default_temperature,
+                true,
+                &config.multimodal,
+                config.agent.max_tool_iterations,
+            ),
+        )
+        .await
 }
 
 #[cfg(test)]
@@ -2526,6 +2683,36 @@ mod tests {
         assert_eq!(feishu_args["delivery"]["to"], "oc_yyy");
     }
 
+    #[test]
+    fn safety_heartbeat_interval_zero_disables_injection() {
+        for counter in [0, 1, 2, 10, 100] {
+            assert!(
+                !should_inject_safety_heartbeat(counter, 0),
+                "counter={counter} should not inject when interval=0"
+            );
+        }
+    }
+
+    #[test]
+    fn safety_heartbeat_interval_one_injects_every_non_initial_step() {
+        assert!(!should_inject_safety_heartbeat(0, 1));
+        for counter in 1..=6 {
+            assert!(
+                should_inject_safety_heartbeat(counter, 1),
+                "counter={counter} should inject when interval=1"
+            );
+        }
+    }
+
+    #[test]
+    fn safety_heartbeat_injects_only_on_exact_multiples() {
+        let interval = 3;
+        let injected: Vec<usize> = (0..=10)
+            .filter(|counter| should_inject_safety_heartbeat(*counter, interval))
+            .collect();
+        assert_eq!(injected, vec![3, 6, 9]);
+    }
+
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::traits::ProviderCapabilities;
@@ -2595,6 +2782,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                quota_metadata: None,
             })
         }
     }
@@ -2613,6 +2801,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 })
                 .collect();
             Self {
@@ -3136,6 +3325,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_uses_non_cli_session_grant_without_waiting_for_prompt() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"echo hi"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "shell",
+            50,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let approval_mgr = ApprovalManager::from_config(&crate::config::AutonomyConfig::default());
+        approval_mgr.grant_non_cli_session("shell");
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run shell"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(&approval_mgr),
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("tool loop should consume non-cli session grants");
+
+        assert_eq!(result, "done");
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "shell tool should execute when runtime non-cli session grant exists"
+        );
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_waits_for_non_cli_approval_resolution() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
@@ -3204,6 +3449,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("tool loop should continue after non-cli approval");
@@ -4349,7 +4595,7 @@ Tail"#;
         .await
         .unwrap();
 
-        let context = build_context(&mem, "status updates", 0.0).await;
+        let context = build_context(&mem, "status updates", 0.0, None).await;
         assert!(context.contains("user_msg_real"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));

@@ -17,8 +17,11 @@
 
 pub mod agents_ipc;
 pub mod apply_patch;
+pub mod auth_profile;
+pub mod bg_run;
 pub mod browser;
 pub mod browser_open;
+pub mod channel_ack_config;
 pub mod cli_discovery;
 pub mod composio;
 pub mod content_search;
@@ -51,13 +54,17 @@ pub mod mcp_protocol;
 pub mod mcp_tool;
 pub mod mcp_transport;
 pub mod memory_forget;
+pub mod memory_observe;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
+pub mod openclaw_migration;
 pub mod pdf_read;
+pub mod pptx_read;
 pub mod process;
 pub mod proxy_config;
 pub mod pushover;
+pub mod quota_tools;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
@@ -77,8 +84,12 @@ pub mod web_search_config;
 pub mod web_search_tool;
 
 pub use apply_patch::ApplyPatchTool;
+pub use bg_run::{
+    format_bg_result_for_injection, BgJob, BgJobStatus, BgJobStore, BgRunTool, BgStatusTool,
+};
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
+pub use channel_ack_config::ChannelAckConfigTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -108,10 +119,13 @@ pub use image_info::ImageInfoTool;
 pub use mcp_client::McpRegistry;
 pub use mcp_tool::McpToolWrapper;
 pub use memory_forget::MemoryForgetTool;
+pub use memory_observe::MemoryObserveTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
+pub use openclaw_migration::OpenClawMigrationTool;
 pub use pdf_read::PdfReadTool;
+pub use pptx_read::PptxReadTool;
 pub use process::ProcessTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
@@ -133,6 +147,9 @@ pub use web_access_config::WebAccessConfigTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_config::WebSearchConfigTool;
 pub use web_search_tool::WebSearchTool;
+
+pub use auth_profile::ManageAuthProfileTool;
+pub use quota_tools::{CheckProviderQuotaTool, EstimateQuotaCostTool, SwitchProviderTool};
 
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
@@ -174,6 +191,22 @@ impl Tool for ArcDelegatingTool {
 
 fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
+}
+
+/// Add background tool execution capabilities to a tool registry
+pub fn add_bg_tools(tools: Vec<Box<dyn Tool>>) -> (Vec<Box<dyn Tool>>, BgJobStore) {
+    let bg_job_store = BgJobStore::new();
+    let tool_arcs: Vec<Arc<dyn Tool>> = tools
+        .into_iter()
+        .map(|t| Arc::from(t) as Arc<dyn Tool>)
+        .collect();
+    let tools_arc = Arc::new(tool_arcs);
+    let bg_run = BgRunTool::new(bg_job_store.clone(), Arc::clone(&tools_arc));
+    let bg_status = BgStatusTool::new(bg_job_store.clone());
+    let mut extended: Vec<Arc<dyn Tool>> = (*tools_arc).clone();
+    extended.push(Arc::new(bg_run));
+    extended.push(Arc::new(bg_status));
+    (boxed_registry_from_arcs(extended), bg_job_store)
 }
 
 /// Create the default tool registry
@@ -279,6 +312,7 @@ pub fn all_tools_with_runtime(
         Arc::new(CronRunTool::new(config.clone(), security.clone())),
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
+        Arc::new(MemoryObserveTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
@@ -287,9 +321,14 @@ pub fn all_tools_with_runtime(
             config.clone(),
             security.clone(),
         )),
+        Arc::new(ChannelAckConfigTool::new(config.clone(), security.clone())),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
         Arc::new(WebAccessConfigTool::new(config.clone(), security.clone())),
         Arc::new(WebSearchConfigTool::new(config.clone(), security.clone())),
+        Arc::new(ManageAuthProfileTool::new(config.clone())),
+        Arc::new(CheckProviderQuotaTool::new(config.clone())),
+        Arc::new(SwitchProviderTool::new(config.clone())),
+        Arc::new(EstimateQuotaCostTool),
         Arc::new(PushoverTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
@@ -314,6 +353,10 @@ pub fn all_tools_with_runtime(
     }
 
     if has_filesystem_access {
+        tool_arcs.push(Arc::new(OpenClawMigrationTool::new(
+            config.clone(),
+            security.clone(),
+        )));
         tool_arcs.push(Arc::new(FileReadTool::new(security.clone())));
         tool_arcs.push(Arc::new(FileWriteTool::new(security.clone())));
         tool_arcs.push(Arc::new(FileEditTool::new(security.clone())));
@@ -373,6 +416,7 @@ pub fn all_tools_with_runtime(
             http_config.max_response_size,
             http_config.timeout_secs,
             http_config.user_agent.clone(),
+            http_config.credential_profiles.clone(),
         )));
     }
 
@@ -425,6 +469,9 @@ pub fn all_tools_with_runtime(
 
     // DOCX text extraction
     tool_arcs.push(Arc::new(DocxReadTool::new(security.clone())));
+
+    // PPTX text extraction
+    tool_arcs.push(Arc::new(PptxReadTool::new(security.clone())));
 
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
@@ -572,7 +619,12 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    boxed_registry_from_arcs(tool_arcs)
+    // Attach background execution wrappers to the finalized registry.
+    // This ensures `bg_run` / `bg_status` are available anywhere the
+    // runtime tool graph is used.
+    let built_tools = boxed_registry_from_arcs(tool_arcs);
+    let (extended_tools, _bg_job_store) = add_bg_tools(built_tools);
+    extended_tools
 }
 
 #[cfg(test)]
@@ -666,6 +718,7 @@ mod tests {
         assert!(names.contains(&"proxy_config"));
         assert!(names.contains(&"web_access_config"));
         assert!(names.contains(&"web_search_config"));
+        assert!(names.contains(&"openclaw_migration"));
     }
 
     #[test]
@@ -710,6 +763,44 @@ mod tests {
         assert!(names.contains(&"proxy_config"));
         assert!(names.contains(&"web_access_config"));
         assert!(names.contains(&"web_search_config"));
+        assert!(names.contains(&"openclaw_migration"));
+    }
+
+    #[test]
+    fn all_tools_includes_docx_read_tool() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+        let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"docx_read"));
+        assert!(names.contains(&"pdf_read"));
     }
 
     #[test]
@@ -752,6 +843,43 @@ mod tests {
         assert!(!names.contains(&"file_read"));
         assert!(!names.contains(&"file_write"));
         assert!(!names.contains(&"file_edit"));
+        assert!(!names.contains(&"openclaw_migration"));
+    }
+
+    #[test]
+    fn all_tools_with_runtime_includes_background_tools() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            runtime,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+        );
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"bg_run"));
+        assert!(names.contains(&"bg_status"));
     }
 
     #[test]
