@@ -15,9 +15,9 @@
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
 pub(crate) mod ack_reaction;
+pub mod acp;
 pub mod bluebubbles;
 pub mod clawdtalk;
-pub mod acp;
 pub mod cli;
 pub mod dingtalk;
 pub mod discord;
@@ -106,8 +106,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Per-sender conversation history for channel messages.
 type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
-type ConversationLockMap =
-    Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+type ConversationLockMap = Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 /// Maximum history messages to keep per sender.
 const MAX_CHANNEL_HISTORY: usize = 50;
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -3350,11 +3349,10 @@ or tune thresholds in config.",
             match session.get_history().await {
                 Ok(history) => {
                     tracing::debug!(history_len = history.len(), "session history loaded");
-                    let filtered: Vec<ChatMessage> =
-                        history
-                            .into_iter()
-                            .filter(|m| crate::providers::is_user_or_assistant_role(m.role.as_str()))
-                            .collect();
+                    let filtered: Vec<ChatMessage> = history
+                        .into_iter()
+                        .filter(|m| crate::providers::is_user_or_assistant_role(m.role.as_str()))
+                        .collect();
                     let mut histories = ctx
                         .conversation_histories
                         .lock()
@@ -5146,6 +5144,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Ensure stale channel handles are never reused across restarts.
     clear_live_channels();
 
+    if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
+        tracing::warn!("plugin registry initialization skipped: {error}");
+    }
+
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -5522,15 +5524,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         message_timeout_secs,
         interrupt_on_new_message,
         multimodal: config.multimodal.clone(),
-        hooks: if config.hooks.enabled {
-            let mut runner = crate::hooks::HookRunner::new();
-            if config.hooks.builtin.command_logger {
-                runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
-            }
-            Some(Arc::new(runner))
-        } else {
-            None
-        },
+        hooks: crate::hooks::HookRunner::from_config(&config.hooks).map(Arc::new),
         non_cli_excluded_tools: Arc::new(Mutex::new(
             config.autonomy.non_cli_excluded_tools.clone(),
         )),
