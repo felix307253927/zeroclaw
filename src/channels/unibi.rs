@@ -6,6 +6,7 @@
  * @LastEditTime       : 2026-02-28 18:42:42
  */
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::config::traits::ChannelConfig;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,15 @@ impl UnibiChannel {
         Self {
             base_url: config.base_url,
         }
+    }
+}
+
+impl ChannelConfig for UnibiConfig {
+    fn name() -> &'static str {
+        "Unibi"
+    }
+    fn desc() -> &'static str {
+        "Unibi Channel"
     }
 }
 

@@ -4217,6 +4217,10 @@ impl ChannelsConfig {
                 self.nostr.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.unibi.as_ref())),
+                self.unibi.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.acp.as_ref())),
                 self.acp.is_some(),
             ),
